@@ -1,0 +1,725 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template with security best practices
+
+Parameters:
+
+  # IAM User Parameters
+  UserName:
+    Description: The user name for the IAM user
+    Type: String
+
+  # Budget Parameters
+  ForecastSpend1:
+    Description: The forecasted spend amount for Budget 1
+    Type: Number
+    Default: 100
+
+  ForecastSpend2:
+    Description: The forecasted spend amount for Budget 2
+    Type: Number
+    Default: 200
+
+  ForecastSpend3:
+    Description: The forecasted spend amount for Budget 3
+    Type: Number
+    Default: 500
+
+  ActualSpend:
+    Description: The actual spend amount for Budget 4
+    Type: Number
+    Default: 50
+
+  EmailAddress:
+    Description: The email address for budget notifications
+    Type: String
+
+  # VPC Parameters
+  VpcCidr:
+    Description: The CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.0\.0/16'
+    ConstraintDescription: Must be a valid IP CIDR block with a /16 mask
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: IAM User Parameters
+        Parameters:
+          - UserName
+      - Label:
+          default: Budget Parameters
+        Parameters:
+          - ForecastSpend1
+          - ForecastSpend2
+          - ForecastSpend3
+          - ActualSpend
+          - EmailAddress
+      - Label:
+          default: VPC Parameters
+        Parameters:
+          - VpcCidr
+    ParameterLabels:
+      UserName:
+        default: IAM User Name
+      ForecastSpend1:
+        default: Budget 1 Forecasted Spend
+      ForecastSpend2:
+        default: Budget 2 Forecasted Spend
+      ForecastSpend3:
+        default: Budget 3 Forecasted Spend
+      ActualSpend:
+        default: Budget 4 Actual Spend
+      EmailAddress:
+        default: Budget Email Address
+      VpcCidr:
+        default: VPC CIDR Block
+
+Resources:
+  # IAM password policy
+  # IAM Role for the Lambda function
+  SetPasswordPolicyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SetPasswordPolicyLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:UpdateAccountPasswordPolicy
+                Resource: "*"
+
+  # Lambda function to set the IAM password policy
+  SetPasswordPolicyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SetPasswordPolicyLambda
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt SetPasswordPolicyLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          def handler(event, context):
+              iam = boto3.client('iam')
+
+              response = iam.update_account_password_policy(
+                  MinimumPasswordLength=16,
+                  RequireSymbols=True,
+                  RequireNumbers=True,
+                  RequireUppercaseCharacters=True,
+                  RequireLowercaseCharacters=True,
+                  AllowUsersToChangePassword=True
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Password policy successfully updated.'
+              }
+      Timeout: 15
+
+  # CustomResource to trigger the Lambda function
+  SetIAMPasswordPolicy:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SetPasswordPolicyLambda.Arn
+
+
+  # IAM group, user, and policy
+  AdministratorGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: Administrator
+
+  AdministratorPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AdministratorAccess
+      Groups:
+        - !Ref AdministratorGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: '*'
+            Resource: '*'
+
+  RandomPasswordFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import random
+          import string
+          import boto3
+
+          def generate_password(length):
+              chars = string.ascii_letters + string.digits
+              return ''.join(random.choice(chars) for _ in range(length))
+
+          def handler(event, context):
+              if event['RequestType'] == 'Create':
+                  password = generate_password(10)
+                  response = {'PhysicalResourceId': 'RandomPassword', 'Data': {'Password': password}}
+              else:
+                  response = {'PhysicalResourceId': 'RandomPassword'}
+
+              client = boto3.client('cloudformation')
+              client.signal_resource(
+                  StackName=event['StackId'],
+                  LogicalResourceId=event['LogicalResourceId'],
+                  UniqueId=context.log_stream_name,
+                  Status='SUCCESS',
+                  **response
+              )
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  RandomPassword:
+    Type: Custom::RandomPassword
+    Version: '1.0'
+    Properties:
+      ServiceToken: !GetAtt RandomPasswordFunction.Arn
+
+  IAMUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref UserName
+      Groups:
+        - !Ref AdministratorGroup
+      LoginProfile:
+        Password: !GetAtt RandomPassword.Data.Password
+        PasswordResetRequired: true
+
+  # S3 bucket for CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # CloudTrail configuration
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+
+  # GuardDuty configuration
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+
+  GuardDutySNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: GuardDuty Findings
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailAddress
+
+  GuardDutyEventRule:
+  Type: AWS::Events::Rule
+  Properties:
+    Name: GuardDutyToSNS
+    Description: Forward GuardDuty findings to SNS topic
+    EventPattern:
+      source:
+        - aws.guardduty
+      detail-type:
+        - GuardDuty Finding
+    State: ENABLED
+    Targets:
+      - Id: GuardDutySNSTarget
+        Arn: !Ref GuardDutySNS
+        InputTransformer:
+          InputPathsMap:
+            severity: '$.detail.severity'
+            Finding_ID: '$.detail.id'
+            Finding_Type: '$.detail.type'
+            region: '$.region'
+            Finding_description: '$.detail.description'
+          InputTemplate: >
+            "Heads up! You have a severity $severity GuardDuty finding of type $Finding_Type in the $region region."
+            "Finding Description: $Finding_description. "
+            "Check it out on the GuardDuty console: https://console.aws.amazon.com/guardduty/home?region=$region#/findings?search=id%3D$Finding_ID"
+
+  # Budgets configuration
+  BudgetsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - budgets.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+
+  BudgetsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BudgetsPolicy
+      Roles:
+        - !Ref BudgetsRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref GuardDutySNS
+
+  Budget1:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref ForecastSpend1
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        NotificationsWithSubscribers:
+          - Notification:
+              NotificationType: FORECASTED
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref EmailAddress
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+
+  Budget2:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref ForecastSpend2
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        NotificationsWithSubscribers:
+          - Notification:
+              NotificationType: FORECASTED
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref EmailAddress
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+
+  Budget3:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref ForecastSpend3
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        NotificationsWithSubscribers:
+          - Notification:
+              NotificationType: FORECASTED
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref EmailAddress
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+
+  Budget4:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref ActualSpend
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        NotificationsWithSubscribers:
+          - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref EmailAddress
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+
+#AWS Config Configuration
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      RecordingGroup:
+        AllSupported: true
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: ConfigServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref ConfigBucket, '/']]
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*' 
+
+#AWS Config Managed Rules
+  RequiredTagsRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: required-tags
+      Description: Checks whether required tags are applied to resources
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters:
+        '{"tag1Key": "Owner", "tag2Key": "Project"}'
+
+  # AWS Security Hub Configuration
+  SecurityHubLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SecurityHubLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchEnableStandards
+                Resource: '*'
+
+  SecurityHubLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EnableSecurityHubStandards
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              security_hub = boto3.client('securityhub')
+
+              standards_to_enable = [
+                  "arn:aws:securityhub:::ruleset/aws-foundational-security-best-practices/v/1.0.0",
+                  "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0"
+              ]
+
+              for standard_arn in standards_to_enable:
+                  try:
+                      security_hub.batch_enable_standards(StandardsSubscriptionRequests=[{'StandardsArn': standard_arn}])
+                      print(f"Enabled Security Hub standard: {standard_arn}")
+                  except Exception as e:
+                      print(f"Error enabling standard {standard_arn}: {str(e)}")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Security Hub standards enabled')
+          }
+      Role: !GetAtt SecurityHubLambdaRole.Arn
+      Timeout: 60
+
+  SecurityHubLambdaTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SecurityHubLambda.Arn
+
+#VPC and VPC Flow Logs Configuration
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: VPCFlowLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref ConfigBucket, '/*']]
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      LogDestination: !Join ['', ['arn:aws:s3:::', !Ref ConfigBucket]]
+      LogDestinationType: s3
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+
+  # Baseline security group for VPC
+  BaselineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: BaselineSecurityGroup
+      GroupDescription: Baseline security group with default rules
+      VpcId: !Ref VPC
+
+  BaselineSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BaselineSecurityGroup
+      IpProtocol: -1
+      FromPort: -1
+      ToPort: -1
+      CidrIp: !Ref VpcCidr
+
+  BaselineSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref BaselineSecurityGroup
+      IpProtocol: -1
+      FromPort: -1
+      ToPort: -1
+      CidrIp: 0.0.0.0/0
+
+#SNS encryption
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SNS Encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref 'AWS::AccountId'
+                kms:ViaService: 'sns.amazonaws.com'
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SecurityNotification
+      KmsMasterKeyId: !Ref KMSKey
+
+#Lambda function for EBS encryption
+  EbsEncryptionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: EbsEncryptionFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateVolume
+                  - ec2:DescribeVolumes
+                  - ec2:ModifyVolume
+                  - sns:Publish
+                Resource: '*'
+
+  EbsEncryptionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EbsEncryptionFunction
+      Handler: index.handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          def handler(event, context):
+              ec2 = boto3.client('ec2')
+              sns = boto3.client('sns')
+              topic_arn = os.environ['SNSTOPICARN']
+
+              response = ec2.describe_volumes(
+                  Filters=[
+                      {'Name': 'encrypted', 'Values': ['false']}
+                  ]
+              )
+
+              for volume in response['Volumes']:
+                  ec2.modify_volume(VolumeId=volume['VolumeId'], KmsKeyId='alias/aws/ebs')
+
+                  message = f"Enabled encryption for EBS volume: {volume['VolumeId']}"
+                  sns.publish(TopicArn=topic_arn, Subject='EBS Encryption Enabled', Message=message)
+
+      Timeout: 60
+      Environment:
+        Variables:
+          SNSTOPICARN: !Ref SNSTopic
+      Role: !GetAtt EbsEncryptionFunctionRole.Arn
+
+  EbsEncryptionFunctionTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt EbsEncryptionFunction.Arn
+
+Outputs:
+  S3BucketName:
+    Value: !Ref CloudTrailBucket
+    Description: S3 bucket for CloudTrail logs
+
+  SNSTopicArn:
+    Value: !Ref SNSTopic
+    Description: SNS Topic ARN for security notifications
+
+  IAMUserPassword:
+    Value: !GetAtt RandomPassword.Data.Password
+    Description: Temporary password for the IAM user in the Administrators group
